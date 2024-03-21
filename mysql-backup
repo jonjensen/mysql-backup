@@ -1,0 +1,146 @@
+#!/bin/sh
+
+# MySQL database dumper
+# by Jon Jensen <jon@endpointdev.com>
+# with contributions from Spencer Christensen, Dan Collis-Puro, Josh Williams
+# Copyright © End Point Corporation
+# License: BSD 2-clause
+#
+# Dumps the databases and compresses the output, but keeps the old dump if
+# nothing has changed since then, to minimize changes visible to rsync.
+#
+# To restore all dump files (substitute correct decompressor):
+# for i in *.sql; do j=`basename $i .sql | sed 's/.*-//'`; echo $j; xzcat $i | mysql $j; done
+
+backupdir=/var/backup/mysql
+mysqluser=root
+options="--opt -B --skip-dump-date"
+skip_tables=''
+skip=''
+
+local_config=`dirname $0`/local_config.sh
+if [ -r "$local_config" ]; then
+	. $local_config
+fi
+
+# Skip any tables (may come from local_config)
+for table in $skip_tables
+do
+	options="${options} --ignore-table=${table}"
+done
+
+
+# Optional filter to prevent some databases from being dumped
+if [ -z "$skip" ]; then
+	skip='^(test|information_schema|performance_schema)$'
+else
+	# Could have more databases to skip listed in local_config
+	skip="^(test|information_schema|performance_schema|$skip)\$"
+fi
+
+
+trap "exit 1" INT
+
+exit=0
+
+hostname=`hostname -s`
+
+# auto-select the best compressor that's installed
+if pxz --version >/dev/null 2>&1; then
+	compressor=pxz
+	compext=.xz
+elif xz --version >/dev/null 2>&1; then
+	compressor=xz
+	compext=.xz
+elif lbzip2 --version >/dev/null 2>&1; then
+	compressor=lbzip2
+	compext=.bz2
+elif pbzip2 --version >/dev/null 2>&1; then
+	compressor="pbzip2 -l"
+	compext=.bz2
+elif bzip2 --help >/dev/null 2>&1; then
+	compressor=bzip2
+	compext=.bz2
+elif pigz --version >/dev/null 2>&1; then
+	compressor=pigz
+	compext=.gz
+elif gzip --version >/dev/null 2>&1; then
+	compressor=gzip
+	compext=.gz
+else
+	echo "Couldn't find any compressor!"
+	exit 11
+fi
+
+cd $backupdir
+if [ $? -ne 0 ]; then
+	echo "Error: cd $backupdir" >&2
+	exit 10
+fi
+
+echo "Dumping MySQL databases on $hostname"
+echo "Skip criteria for grep: $skip"
+echo "Using compressor: $compressor"
+date
+
+umask 027
+
+# Test mysql connection
+echo 'show databases' | mysql -u $mysqluser || exit $?
+
+for db in `echo 'show databases' | mysql -u $mysqluser | tail -n +2 | egrep -v "$skip"`
+do
+	echo "Dumping database $db"
+	basename=$hostname-mysql-$db.sql
+	sqlfile=$basename$compext
+	workfile=$basename.work
+	workfilecomp=$workfile$compext
+	if [ -f $workfile ]; then
+		echo "Removing file that is in the way: $workfile" >&2
+		rm -f $workfile
+		exit=30
+	fi
+	mysqldump -u $mysqluser $options $db > $workfile
+	if [ $? -ne 0 ]; then
+		echo "Error dumping; leaving old dump intact and work file remains" >&2
+		exit=21
+	else
+		if [ -f $workfilecomp ]; then
+			echo "Removing file that is in the way: $workfilecomp" >&2
+			rm -f $workfilecomp
+			exit=31
+		fi
+		echo "Compressing dump file $workfile"
+		nice $compressor $workfile
+		if [ $? -ne 0 ]; then
+			echo "Error running $compressor; leaving old dump intact and work file remains" >&2
+			exit=25
+		else
+			if [ -f $sqlfile ]; then
+				cmp -s $sqlfile $workfilecomp
+				if [ $? -eq 0 ]; then
+					echo "Dump is identical to last time; leaving old dump intact"
+					rm -f $workfilecomp
+				elif [ $? -eq 1 ]; then
+					echo "Dump is different; replacing old dump with new one"
+					mv $workfilecomp $sqlfile
+				else
+					echo "Error comparing new to old dump; work file remains" >&2
+					exit=26
+				fi
+			else
+				echo "Initial dump"
+				mv $workfilecomp $sqlfile
+			fi
+		fi
+	fi
+done
+
+if [ $exit -eq 0 ]; then
+	date | tee $hostname-mysql-success.txt
+else
+	date
+fi
+echo Done
+
+exit $exit
